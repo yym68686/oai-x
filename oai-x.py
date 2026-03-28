@@ -3,6 +3,7 @@ import base64
 import getpass
 import hashlib
 import json
+import os
 import random
 import re
 import secrets
@@ -361,6 +362,42 @@ def submit_token_to_api(token_json: str, api_url: str, api_token: str) -> bool:
     except Exception as e:
         print(f"[ERROR] Exception while submitting token: {e}")
         return False
+
+
+def resolve_storage_mode(storage_mode: str, database_url: str = "") -> str:
+    resolved = (storage_mode or "auto").strip().lower()
+    if resolved != "auto":
+        return resolved
+    if (database_url or "").strip() or os.getenv("DATABASE_URL", "").strip():
+        return "db"
+    return "file"
+
+
+def save_token_to_database(token_json: str, database_url: str = "") -> bool:
+    try:
+        if database_url:
+            os.environ["DATABASE_URL"] = database_url
+        from token_store import save_token_json_sync
+
+        stored = save_token_json_sync(token_json)
+        print(
+            "[*] Registration successful! Token saved to database: "
+            f"id={stored.id} email={stored.email or 'unknown'} account_id={stored.account_id or 'unknown'}"
+        )
+        return True
+    except Exception as e:
+        print(f"[ERROR] Failed to save token to database: {e}")
+        return False
+
+
+def save_token_to_file(token_json: str) -> str:
+    token_data = json.loads(token_json)
+    sanitized_email = str(token_data.get("email") or "unknown").replace("@", "_")
+    file_name = f"token_{sanitized_email}_{int(time.time())}.json"
+    with open(file_name, "w", encoding="utf-8") as f:
+        f.write(token_json)
+    print(f"[*] Token saved to file: {file_name}")
+    return file_name
 
 
 def perform_registration_flow(
@@ -877,12 +914,23 @@ def main():
     )
     parser.add_argument("--api-url", help="API URL for auto submission")
     parser.add_argument("--api-token", help="API authorization token for auto submission")
+    parser.add_argument(
+        "--storage-mode",
+        choices=["auto", "file", "db", "both"],
+        default=os.getenv("OAI_X_STORAGE_MODE", "auto"),
+        help="Where successful registrations are stored (default: auto)",
+    )
+    parser.add_argument("--database-url", help="PostgreSQL DATABASE_URL for token storage")
     parser.add_argument("--yyds-api-key", help="YYDS Mail API key (AC-...) for the 'yyds' mail provider")
     args = parser.parse_args()
 
     auto_submit = args.auto_submit
     api_url = args.api_url
     api_token = args.api_token
+    storage_mode = resolve_storage_mode(args.storage_mode, args.database_url or "")
+
+    if args.database_url:
+        os.environ["DATABASE_URL"] = args.database_url
 
     if auto_submit:
         if not api_url:
@@ -907,27 +955,40 @@ def main():
     sleep_max = max(sleep_min, args.sleep_max)
 
     iteration_count = 0
-    print(f"[*] Starting OpenAI automatic registration script. (mail provider: {args.mail_provider})")
+    print(
+        "[*] Starting OpenAI automatic registration script. "
+        f"(mail provider: {args.mail_provider}, storage: {storage_mode})"
+    )
     while True:
         iteration_count += 1
         print(f"\n[{datetime.now().strftime('%H:%M:%S')}] >>> Starting registration iteration #{iteration_count} <<<")
         try:
             token_json = perform_registration_flow(args.proxy, mail_provider=args.mail_provider)
             if token_json:
+                saved_to_db = False
+                saved_to_file = False
+
+                if storage_mode in {"db", "both"}:
+                    saved_to_db = save_token_to_database(token_json, args.database_url or "")
+                    if not saved_to_db and storage_mode == "db":
+                        print("[WARN] Database save failed, writing local file as fallback to avoid data loss...")
+                        save_token_to_file(token_json)
+                        saved_to_file = True
+
                 submitted = False
                 if auto_submit:
                     submitted = submit_token_to_api(token_json, api_url, api_token)
                     if submitted:
                         print("[*] Token successfully submitted!")
                     else:
-                        print("[WARN] Submission failed, saving locally as fallback...")
-                if not submitted:
-                    token_data = json.loads(token_json)
-                    sanitized_email = token_data.get("email", "unknown").replace("@", "_")
-                    file_name = f"token_{sanitized_email}_{int(time.time())}.json"
-                    with open(file_name, "w", encoding="utf-8") as f:
-                        f.write(token_json)
-                    print(f"[*] Registration successful! Token saved to file: {file_name}")
+                        print("[WARN] Token submission failed.")
+
+                if storage_mode in {"file", "both"} and not saved_to_file:
+                    save_token_to_file(token_json)
+                    saved_to_file = True
+
+                if not saved_to_db and not saved_to_file and not submitted:
+                    print("[WARN] Token was generated but not persisted anywhere.")
             else:
                 print("[WARN] Registration iteration failed.")
         except Exception as e:

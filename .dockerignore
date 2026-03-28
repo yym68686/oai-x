@@ -1,0 +1,10 @@
+.git
+.gitignore
+.venv
+.uv-cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+token_*.json

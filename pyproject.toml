@@ -4,4 +4,11 @@ version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+    "asyncpg>=0.30",
+    "curl-cffi>=0.13",
+    "fastapi>=0.115",
+    "httpx>=0.28",
+    "SQLAlchemy>=2.0",
+    "uvicorn>=0.30",
+]

@@ -1,0 +1,53 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: oai-x-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-oai_x}
+      POSTGRES_USER: ${POSTGRES_USER:-oai_x}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-oai_x_password}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: oai-x-gateway
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "${GATEWAY_PORT:-8000}:8000"
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-oai_x}:${POSTGRES_PASSWORD:-oai_x_password}@postgres:5432/${POSTGRES_DB:-oai_x}
+      SERVICE_API_KEYS: ${SERVICE_API_KEYS:-change-me}
+      MIN_AVAILABLE_CODEX_TOKENS: ${MIN_AVAILABLE_CODEX_TOKENS:-50}
+      TOKEN_POOL_CHECK_INTERVAL_SECONDS: ${TOKEN_POOL_CHECK_INTERVAL_SECONDS:-15}
+      MAX_REQUEST_ACCOUNT_RETRIES: ${MAX_REQUEST_ACCOUNT_RETRIES:-100}
+      DEFAULT_USAGE_LIMIT_COOLDOWN_SECONDS: ${DEFAULT_USAGE_LIMIT_COOLDOWN_SECONDS:-300}
+      CODEX_BASE_URL: ${CODEX_BASE_URL:-}
+      OAI_X_REPLENISH_CMD: ${OAI_X_REPLENISH_CMD:-}
+      OAI_X_REPLENISH_ARGS: ${OAI_X_REPLENISH_ARGS:-}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=5).read()",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  postgres_data:
