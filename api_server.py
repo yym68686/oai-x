@@ -227,12 +227,12 @@ async def _refresh_codex_access_token(client: httpx.AsyncClient, refresh_token: 
     }
 
 
-async def _get_codex_access_token(token_row, client: httpx.AsyncClient) -> str:
+async def _get_codex_access_token(token_row, client: httpx.AsyncClient) -> tuple[str, bool]:
     lock = _oauth_lock(token_row.id)
     async with lock:
         cache_entry = _oauth_cache.get(token_row.id) or {}
         if _access_token_is_valid(cache_entry.get("access_token"), cache_entry.get("expires_at")):
-            return str(cache_entry["access_token"])
+            return str(cache_entry["access_token"]), False
 
         if _access_token_is_valid(token_row.access_token, token_row.expires_at):
             _oauth_cache[token_row.id] = {
@@ -240,7 +240,7 @@ async def _get_codex_access_token(token_row, client: httpx.AsyncClient) -> str:
                 "refresh_token": token_row.refresh_token,
                 "expires_at": token_row.expires_at,
             }
-            return str(token_row.access_token)
+            return str(token_row.access_token), False
 
         refreshed = await _refresh_codex_access_token(client, token_row.refresh_token)
         next_refresh_token = refreshed.get("refresh_token") or token_row.refresh_token
@@ -258,7 +258,7 @@ async def _get_codex_access_token(token_row, client: httpx.AsyncClient) -> str:
         token_row.access_token = refreshed["access_token"]
         token_row.refresh_token = next_refresh_token
         token_row.expires_at = refreshed.get("expires_at")
-        return refreshed["access_token"]
+        return refreshed["access_token"], True
 
 
 def _build_upstream_headers(http_request: Request, access_token: str, account_id: str | None, stream: bool) -> dict[str, str]:
@@ -492,16 +492,22 @@ app = FastAPI(title="oai-x Codex Proxy", version="0.2.0", lifespan=lifespan)
 @app.get("/healthz")
 async def healthz(request: Request):
     counts = await get_token_counts()
-    return {
-        "ok": True,
-        "upstream": _codex_responses_url(),
-        "total_tokens": counts.total,
-        "active_tokens": counts.active,
-        "available_tokens": counts.available,
-        "cooling_tokens": counts.cooling,
-        "min_available_tokens": _min_available_codex_tokens(),
-        "replenisher_running": _replenisher_is_running(request.app),
-    }
+    min_available = _min_available_codex_tokens()
+    ok = counts.available > 0
+    return JSONResponse(
+        status_code=200 if ok else 503,
+        content={
+            "ok": ok,
+            "upstream": _codex_responses_url(),
+            "total_tokens": counts.total,
+            "active_tokens": counts.active,
+            "available_tokens": counts.available,
+            "cooling_tokens": counts.cooling,
+            "min_available_tokens": min_available,
+            "degraded": counts.available < min_available,
+            "replenisher_running": _replenisher_is_running(request.app),
+        },
+    )
 
 
 async def _stream_upstream_response(
@@ -601,7 +607,7 @@ async def responses_route(
             break
 
         try:
-            access_token = await _get_codex_access_token(token_row, client)
+            access_token, access_token_refreshed = await _get_codex_access_token(token_row, client)
         except HTTPException as exc:
             _oauth_cache.pop(token_row.id, None)
             await mark_token_error(token_row.id, str(exc.detail), deactivate=exc.status_code in (401, 403))
@@ -626,6 +632,7 @@ async def responses_route(
             detail = str(getattr(exc, "detail", "") or exc)
             cooldown_seconds = _extract_usage_limit_cooldown_seconds(status_code, detail)
             permanently_disabled = _is_permanent_account_disable_error(status_code, detail)
+            auth_failed_after_refresh = status_code in (401, 403) and access_token_refreshed
 
             if cooldown_seconds is not None:
                 await mark_token_error(
@@ -645,14 +652,20 @@ async def responses_route(
                 _kick_token_pool_maintenance(http_request.app, reason="usage-limit-cooldown")
                 continue
 
-            if permanently_disabled:
+            if permanently_disabled or auth_failed_after_refresh:
                 _oauth_cache.pop(token_row.id, None)
-                await mark_token_error(token_row.id, detail, deactivate=True)
+                await mark_token_error(
+                    token_row.id,
+                    detail,
+                    deactivate=True,
+                    clear_access_token=True,
+                )
                 logger.warning(
-                    "Codex account permanently disabled: token_id=%s account_id=%s status=%s attempt=%s/%s",
+                    "Codex account disabled after upstream auth failure: token_id=%s account_id=%s status=%s refreshed=%s attempt=%s/%s",
                     token_row.id,
                     token_row.account_id,
                     status_code,
+                    access_token_refreshed,
                     attempt,
                     max_attempts,
                 )
@@ -662,7 +675,15 @@ async def responses_route(
 
             if status_code in (401, 403):
                 _oauth_cache.pop(token_row.id, None)
-                await mark_token_error(token_row.id, detail)
+                await mark_token_error(token_row.id, detail, clear_access_token=True)
+                logger.warning(
+                    "Codex upstream auth failed; invalidated access token for retry: token_id=%s account_id=%s status=%s attempt=%s/%s",
+                    token_row.id,
+                    token_row.account_id,
+                    status_code,
+                    attempt,
+                    max_attempts,
+                )
                 last_error = exc
                 _kick_token_pool_maintenance(http_request.app, reason="upstream-auth-failed")
                 continue

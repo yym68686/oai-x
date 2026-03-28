@@ -185,6 +185,7 @@ async def mark_token_error(
     *,
     deactivate: bool = False,
     cooldown_seconds: int | None = None,
+    clear_access_token: bool = False,
 ) -> None:
     async with get_session() as session:
         async with session.begin():
@@ -193,6 +194,9 @@ async def mark_token_error(
                 return
             token.last_error = message[:4000]
             token.updated_at = utcnow()
+            if clear_access_token:
+                token.access_token = None
+                token.expires_at = None
             if deactivate:
                 token.is_active = False
                 token.cooldown_until = None
