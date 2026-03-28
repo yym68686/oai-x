@@ -131,10 +131,11 @@ async def claim_next_active_token() -> CodexToken | None:
                     CodexToken.updated_at.asc(),
                     CodexToken.id.asc(),
                 )
+                .limit(1)
                 .with_for_update(skip_locked=True)
             )
             result = await session.execute(stmt)
-            token = result.scalar_one_or_none()
+            token = result.scalars().first()
             if token is None:
                 return None
             token.last_used_at = utcnow()
